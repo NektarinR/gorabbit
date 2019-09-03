@@ -1,23 +1,21 @@
 package main
 
 import (
+	"github.com/streadway/amqp"
 	"log"
-	amqp "github.com/streadway/amqp"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
-func main(){
+func main() {
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:30001/")
-	if err != nil{
+	if err != nil {
 		panic(err)
 	}
-	defer func() {
-		if !conn.IsClosed(){
-			conn.Close()
-		}
-	}()
+	defer conn.Close()
 	ch, err := conn.Channel()
-	if err != nil{
+	if err != nil {
 		panic(err)
 	}
 	defer ch.Close()
@@ -30,20 +28,49 @@ func main(){
 		false,    // no-wait
 		nil,      // arguments
 	)
-	if err != nil{
+	if err != nil {
 		panic(err)
 	}
-	body := bodyFrom(os.Args)
-	err = ch.Publish(
-		"logs", // exchange
+	q, err := ch.QueueDeclare(
+		"",    // name
+		false, // durable
+		false, // delete when usused
+		true,  // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	if err != nil {
+		panic(err)
+	}
+	err = ch.QueueBind(
+		q.Name, // queue name
 		"",     // routing key
-		false,  // mandatory
-		false,  // immediate
-		amqp.Publishing{
-			ContentType: "text/plain",
-			Body:        []byte(body),
-		})
-	if err != nil{
+		"logs", // exchange
+		false,
+		nil,
+	)
+	if err != nil {
 		panic(err)
 	}
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	if err != nil {
+		panic(err)
+	}
+	go func(input <-chan amqp.Delivery) {
+		log.Printf("Сервер запущен и слушает, очередь: %s\n", q.Name)
+		for msg := range input {
+			_ = msg
+		}
+	}(msgs)
+	closeApp := make(chan os.Signal, 1)
+	signal.Notify(closeApp, syscall.SIGINT)
+	<-closeApp
 }
