@@ -1,12 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"fmt"
 	"github.com/streadway/amqp"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 )
 
 func main() {
@@ -14,25 +15,46 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer func() {
-		if !conn.IsClosed() {
-			conn.Close()
-		}
-	}()
+	defer conn.Close()
 	ch, err := conn.Channel()
 	if err != nil {
 		panic(err)
 	}
 	defer ch.Close()
-	msg := make(chan string, 10)
+	q := initQueue(ch)
+	msgs := initDelivery(ch, q)
+	go getAnswer(msgs)
+	stdioMsg := make(chan string, 10)
 	log.Println("Клиент запущен")
-	go func(output chan<- string) {
-		timer := time.NewTicker(5 * time.Millisecond)
-		for v := range timer.C {
-			output <- v.String()
+	go getMessageFromIO(stdioMsg)
+	initExchange(ch)
+	go sendMessageToExchange(stdioMsg, ch, q)
+	exit := make(chan os.Signal, 1)
+	signal.Notify(exit, syscall.SIGINT)
+	<-exit
+	close(stdioMsg)
+}
+
+func sendMessageToExchange(input <-chan string, ch *amqp.Channel, q *amqp.Queue) {
+	for txt := range input {
+		err := ch.Publish(
+			"logs", // exchange
+			"",     // routing key
+			false,  // mandatory
+			false,  // immediate
+			amqp.Publishing{
+				ReplyTo:     q.Name,
+				ContentType: "text/plain",
+				Body:        []byte(txt),
+			})
+		if err != nil {
+			panic(err)
 		}
-	}(msg)
-	err = ch.ExchangeDeclare(
+	}
+}
+
+func initExchange(ch *amqp.Channel) {
+	err := ch.ExchangeDeclare(
 		"logs",   // name
 		"fanout", // type
 		true,     // durable
@@ -44,24 +66,51 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	go func(input <-chan string) {
-		for txt := range input {
-			err = ch.Publish(
-				"logs", // exchange
-				"",     // routing key
-				false,  // mandatory
-				false,  // immediate
-				amqp.Publishing{
-					ContentType: "text/plain",
-					Body:        []byte(txt),
-				})
-			if err != nil {
-				panic(err)
-			}
-			go log.Printf("Отправил: %s\n", txt)
-		}
-	}(msg)
-	exit := make(chan os.Signal, 1)
-	signal.Notify(exit, syscall.SIGINT)
-	<-exit
+}
+
+func getMessageFromIO(output chan string) {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Println("Введите: ")
+		symb, _ := reader.ReadString('\n')
+		output <- symb[:len(symb)-1]
+		go fmt.Printf("Клиент отправил: %s\n", symb[:len(symb)-1])
+	}
+}
+
+func getAnswer(answerFromRPC <-chan amqp.Delivery) {
+	for ms := range answerFromRPC {
+		log.Printf("Клиент получил: %s", string(ms.Body))
+	}
+}
+
+func initDelivery(ch *amqp.Channel, q *amqp.Queue) <-chan amqp.Delivery {
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	if err != nil {
+		panic(err)
+	}
+	return msgs
+}
+
+func initQueue(ch *amqp.Channel) *amqp.Queue {
+	q, err := ch.QueueDeclare(
+		"",    // name
+		false, // durable
+		false, // delete when usused
+		true,  // exclusive
+		false, // noWait
+		nil,   // arguments
+	)
+	if err != nil {
+		panic(err)
+	}
+	return &q
 }
